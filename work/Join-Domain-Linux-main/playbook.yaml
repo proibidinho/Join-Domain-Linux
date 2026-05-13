@@ -1,0 +1,27 @@
+---
+- name: Projeto para inserir Unix no domínio - Adicionar VM ao Inventory 
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+
+    - name: Adicionado a vm ao inventory 
+      ansible.builtin.include_role:
+        name: inventory
+
+- name: Projeto para inserir Unix no domínio - Configuração Completa
+  hosts: unix
+  #remote_user: svc_aap
+  #become: true
+  gather_facts: false
+
+  tasks:
+  
+    - name: Configurações para o Red Hat Subscription Manager
+      ansible.builtin.include_role:
+        name: linux
+
+    - name: Inserindo a máquina no domínio
+      ansible.builtin.include_role:
+        name: join-domain
