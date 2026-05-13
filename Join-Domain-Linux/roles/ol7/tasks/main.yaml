@@ -1,0 +1,231 @@
+---
+# ============================================================================
+#  ROLE: ol7  (Oracle Linux 7 - LEGADO - SOMENTE `raw`)
+#  - Sem subscription-manager (Oracle Linux não usa RHSM)
+#  - Mesma resiliência do role rhel7
+# ============================================================================
+
+# ============================ SELINUX =======================================
+- name: "[OL7] SELinux runtime permissive"
+  ansible.builtin.raw: setenforce 0 || true
+  changed_when: false
+
+- name: "[OL7] SELinux config persistente = disabled"
+  ansible.builtin.raw: |
+    if grep -q "^SELINUX=" /etc/selinux/config; then
+      sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
+    else
+      echo "SELINUX=disabled" >> /etc/selinux/config
+    fi
+  changed_when: true
+
+# ============================ FIREWALL ======================================
+- name: "[OL7] Parar e desabilitar firewalld"
+  ansible.builtin.raw: |
+    systemctl stop firewalld 2>/dev/null || true
+    systemctl disable firewalld 2>/dev/null || true
+  changed_when: false
+
+# =========================== PACOTES AD =====================================
+- name: "[OL7] Instalar pacotes realmd/sssd/adcli/authconfig"
+  ansible.builtin.raw: |
+    yum install -y realmd sssd sssd-tools oddjob oddjob-mkhomedir adcli \
+      samba-common samba-common-tools krb5-workstation \
+      authconfig
+  register: pkg_inst
+  retries: 3
+  delay: 10
+  until: pkg_inst.rc == 0
+
+# =========================== CYBERARK =======================================
+- name: "[OL7] Obter credenciais CyberArk"
+  ansible.builtin.set_fact:
+    cyberark_creds: "{{ lookup('cyberark_claro') }}"
+  delegate_to: localhost
+  no_log: true
+
+# ============== VERIFICA SE JÁ ESTÁ NO DOMÍNIO ==============================
+- name: "[OL7] Verificar realm atual"
+  ansible.builtin.raw: realm list 2>/dev/null | grep -i "{{ ad_domain }}" || true
+  register: domain_check
+  changed_when: false
+
+# ============================= JOIN =========================================
+- name: "[OL7] Join no domínio (idempotente)"
+  ansible.builtin.raw: |
+    echo {{ cyberark_creds.Content | quote }} | /usr/sbin/adcli join \
+      --domain={{ ad_domain }} \
+      --domain-controller={{ ad_dc }} \
+      --login-user={{ cyberark_creds.UserName | quote }} \
+      --stdin-password
+  register: join_result
+  retries: 3
+  delay: 15
+  until: join_result.rc == 0
+  when: domain_check.stdout | trim == ''
+  no_log: true
+
+- name: "[OL7] Aguardar replicação AD"
+  ansible.builtin.pause:
+    seconds: 15
+
+# ====================== TEMPLATES (heredoc via raw) =========================
+- name: "[OL7] Renderizar /etc/krb5.conf"
+  ansible.builtin.raw: |
+    cat > /etc/krb5.conf << 'EOF_KRB5'
+    {{ lookup('template', 'krb5.conf.j2') }}
+    EOF_KRB5
+    chmod 0644 /etc/krb5.conf
+  changed_when: true
+
+- name: "[OL7] Renderizar /etc/sssd/sssd.conf"
+  ansible.builtin.raw: |
+    install -d -m 0711 /etc/sssd
+    cat > /etc/sssd/sssd.conf << 'EOF_SSSD'
+    {{ lookup('template', 'sssd.conf.j2') }}
+    EOF_SSSD
+    chown root:root /etc/sssd/sssd.conf
+    chmod 0600 /etc/sssd/sssd.conf
+  changed_when: true
+
+- name: "[OL7] Renderizar /etc/pam.d/password-auth-ac"
+  ansible.builtin.raw: |
+    cat > /etc/pam.d/password-auth-ac << 'EOF_PAM1'
+    {{ lookup('template', 'password-auth-ac.j2') }}
+    EOF_PAM1
+    chmod 0644 /etc/pam.d/password-auth-ac
+  changed_when: true
+
+- name: "[OL7] Renderizar /etc/pam.d/system-auth-ac"
+  ansible.builtin.raw: |
+    cat > /etc/pam.d/system-auth-ac << 'EOF_PAM2'
+    {{ lookup('template', 'system-auth-ac.j2') }}
+    EOF_PAM2
+    chmod 0644 /etc/pam.d/system-auth-ac
+  changed_when: true
+
+# ======================= sshd_config (com sshd -t) ==========================
+- name: "[OL7] Backup sshd_config atual"
+  ansible.builtin.raw: cp -f /etc/ssh/sshd_config /etc/ssh/sshd_config.bkp.$(date +%s) 2>/dev/null || true
+  changed_when: false
+
+- name: "[OL7] Renderizar sshd_config em /etc/ssh/sshd_config.new"
+  ansible.builtin.raw: |
+    cat > /etc/ssh/sshd_config.new << 'EOF_SSHD'
+    {{ lookup('template', 'sshd_config.j2') }}
+    EOF_SSHD
+    chown root:root /etc/ssh/sshd_config.new
+    chmod 0600 /etc/ssh/sshd_config.new
+
+- name: "[OL7] Validar sshd_config com 'sshd -t'"
+  ansible.builtin.raw: /usr/sbin/sshd -t -f /etc/ssh/sshd_config.new
+  register: sshd_test
+  changed_when: false
+  failed_when: sshd_test.rc != 0
+
+- name: "[OL7] Aplicar sshd_config (após validação)"
+  ansible.builtin.raw: |
+    install -o root -g root -m 0600 /etc/ssh/sshd_config.new /etc/ssh/sshd_config
+    rm -f /etc/ssh/sshd_config.new
+  when: sshd_test.rc == 0
+  changed_when: true
+
+- name: "[OL7] Validar config final do sshd com 'sshd -T'"
+  ansible.builtin.raw: /usr/sbin/sshd -T >/dev/null
+  register: sshd_T
+  changed_when: false
+  failed_when: sshd_T.rc != 0
+
+# ======================== sudoers (com visudo -c) ===========================
+- name: "[OL7] Renderizar sudoers temporário"
+  ansible.builtin.raw: |
+    cat > /tmp/sudoers.test << 'EOF_SUDO'
+    {{ lookup('template', 'sudoers.j2') }}
+    EOF_SUDO
+    chmod 0440 /tmp/sudoers.test
+
+- name: "[OL7] Validar sudoers (visudo -c)"
+  ansible.builtin.raw: visudo -c -f /tmp/sudoers.test
+  register: sudo_check
+  changed_when: false
+  failed_when: sudo_check.rc != 0
+
+- name: "[OL7] Aplicar /etc/sudoers (após validação)"
+  ansible.builtin.raw: |
+    install -o root -g root -m 0440 /tmp/sudoers.test /etc/sudoers
+    rm -f /tmp/sudoers.test
+  when: sudo_check.rc == 0
+  changed_when: true
+
+# ====================== authconfig + restart serviços =======================
+- name: "[OL7] Habilitar sssd + mkhomedir via authconfig"
+  ansible.builtin.raw: authconfig --enablesssd --enablesssdauth --enablemkhomedir --update
+  changed_when: true
+
+- name: "[OL7] Enable + restart serviços"
+  ansible.builtin.raw: |
+    systemctl enable realmd sssd oddjobd sshd 2>/dev/null || chkconfig sssd on || true
+    systemctl restart sssd oddjobd 2>/dev/null || service sssd restart || true
+    systemctl reload sshd 2>/dev/null || service sshd reload || true
+  changed_when: true
+
+- name: "[OL7] Aguardar serviços estabilizarem"
+  ansible.builtin.pause:
+    seconds: 5
+
+- name: "[OL7] Status do sssd"
+  ansible.builtin.raw: |
+    if systemctl is-active sssd >/dev/null 2>&1; then echo active
+    elif service sssd status >/dev/null 2>&1; then echo active
+    else echo failed
+    fi
+  register: sssd_status
+  changed_when: false
+
+- name: "[OL7] Falhar se sssd não estiver ativo"
+  ansible.builtin.fail:
+    msg: "sssd não está ativo em {{ inventory_hostname }}"
+  when: "'active' not in (sssd_status.stdout | default(''))"
+
+# =========================== VALIDAÇÕES AD ==================================
+- name: "[OL7] realm list deve mostrar {{ ad_domain }}"
+  ansible.builtin.raw: realm list | grep -i "{{ ad_domain }}"
+  register: realm_after
+  retries: 3
+  delay: 10
+  until: realm_after.rc == 0
+  changed_when: false
+  failed_when: realm_after.rc != 0
+
+- name: "[OL7] kinit do usuário de teste"
+  ansible.builtin.raw: echo {{ test_password | quote }} | kinit {{ test_user }}@{{ ad_domain | upper }}
+  register: kinit_test
+  changed_when: false
+  failed_when: kinit_test.rc != 0
+  no_log: true
+  when: test_password is defined and (test_password | length) > 0
+
+- name: "[OL7] getent passwd do usuário AD"
+  ansible.builtin.raw: getent passwd "{{ test_user }}@{{ ad_domain }}"
+  register: getent_test
+  retries: 3
+  delay: 10
+  until: getent_test.rc == 0
+  changed_when: false
+  failed_when: getent_test.rc != 0
+
+- name: "[OL7] id do usuário AD"
+  ansible.builtin.raw: id "{{ test_user }}@{{ ad_domain }}"
+  register: id_test
+  changed_when: false
+  failed_when: id_test.rc != 0
+
+- name: "[OL7] Limpar ticket kerberos"
+  ansible.builtin.raw: kdestroy 2>/dev/null || true
+  changed_when: false
+
+- name: "[OL7] SUCESSO"
+  ansible.builtin.debug:
+    msg: >-
+      [OL7] {{ inventory_hostname }} integrado ao {{ ad_domain }}
+      | usuário {{ test_user }} validado (kinit + getent + id OK)

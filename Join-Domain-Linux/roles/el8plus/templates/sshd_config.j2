@@ -1,0 +1,23 @@
+# sshd_config - gerado por Ansible (role rhel7/ol7/el8plus)
+# Validado por: sshd -t -f <file>  e  sshd -T
+Include /etc/ssh/sshd_config.d/*.conf
+
+PermitRootLogin yes
+
+AuthorizedKeysFile      .ssh/authorized_keys
+
+PasswordAuthentication yes
+ChallengeResponseAuthentication no
+
+GSSAPIAuthentication yes
+GSSAPICleanupCredentials no
+
+UsePAM yes
+
+X11Forwarding yes
+
+PrintMotd no
+
+Subsystem       sftp    /usr/libexec/openssh/sftp-server
+
+AllowGroups wheel root PS_crk_aap_admin PScrkaapadmin

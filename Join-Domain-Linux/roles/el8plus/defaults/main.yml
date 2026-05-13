@@ -1,0 +1,11 @@
+---
+ad_domain: corp.clarobr
+ad_dc: caadscp05.corp.clarobr
+
+# Usuário de teste pós-join
+test_user: z601427
+test_password: "Dev!lmc12"
+
+# Credenciais RHSM (usado somente quando ansible_distribution == 'RedHat')
+rhsm_user: supunixclaro
+rhsm_pass: "!Q14r0rHn+"

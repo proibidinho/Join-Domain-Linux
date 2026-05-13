@@ -1,0 +1,7 @@
+---
+- name: Adiciona servidores ao grupo unix
+  ansible.builtin.add_host:
+    name: "{{ item | trim }}"
+    groups: unix
+  loop: "{{ servers.splitlines() | map('trim') | unique | list }}"
+  run_once: true

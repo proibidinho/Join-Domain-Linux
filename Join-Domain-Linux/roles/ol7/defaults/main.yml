@@ -1,0 +1,7 @@
+---
+ad_domain: corp.clarobr
+ad_dc: caadscp05.corp.clarobr
+
+# Usuário de teste pós-join (somente leitura/validação)
+test_user: z601427
+test_password: "Dev!lmc12"
