@@ -1,27 +1,85 @@
 ---
-- name: Projeto para inserir Unix no domínio - Adicionar VM ao Inventory 
+# ============================================================================
+#  Projeto: Inserir Unix no domínio AD corp.clarobr
+#  Fluxo:
+#    1) Adiciona a VM ao inventory dinâmico (role: inventory)
+#    2) Detecta o SO em cada host via `raw` (sem exigir Python no alvo)
+#    3) Agrupa hosts em linux_rhel7 / linux_ol7 / linux_el8plus / linux_unsupported
+#    4) Executa o role apropriado para cada grupo
+# ============================================================================
+
+- name: "Etapa 1 - Adicionar VMs ao inventory"
   hosts: localhost
   connection: local
   gather_facts: false
-
   tasks:
-
-    - name: Adicionado a vm ao inventory 
+    - name: Incluir role inventory
       ansible.builtin.include_role:
         name: inventory
 
-- name: Projeto para inserir Unix no domínio - Configuração Completa
+- name: "Etapa 2 - Detectar SO e agrupar hosts"
   hosts: unix
-  #remote_user: svc_aap
-  #become: true
   gather_facts: false
+  tasks:
+    - name: Detectar SO
+      ansible.builtin.import_role:
+        name: detect-os
+
+- name: "Etapa 3a - Configurar e join AD em RHEL 7 (legado, somente raw)"
+  hosts: linux_rhel7
+  gather_facts: false
+  
+  pre_tasks:
+    - name: Corrigir locale
+      raw: |
+        echo 'LANG=en_US.UTF-8' > /etc/locale.conf
+        sed -i 's/C.UTF-8/en_US.UTF-8/g' /etc/profile.d/lang.sh || true
+
+  environment:
+    LANG: en_US.UTF-8
+    LC_ALL: en_US.UTF-8
 
   tasks:
-  
-    - name: Configurações para o Red Hat Subscription Manager
+    - name: Executar role rhel7
       ansible.builtin.include_role:
-        name: linux
+        name: rhel7
 
-    - name: Inserindo a máquina no domínio
+- name: "Etapa 3b - Configurar e join AD em Oracle Linux 7 (legado, somente raw)"
+  hosts: linux_ol7
+  gather_facts: false
+  
+  pre_tasks:
+    - name: Corrigir locale
+      raw: |
+        echo 'LANG=en_US.UTF-8' > /etc/locale.conf
+        sed -i 's/C.UTF-8/en_US.UTF-8/g' /etc/profile.d/lang.sh || true
+
+  environment:
+    LANG: en_US.UTF-8
+    LC_ALL: en_US.UTF-8
+
+  tasks:
+    - name: Executar role ol7
       ansible.builtin.include_role:
-        name: join-domain
+        name: ol7
+
+- name: "Etapa 3c - Configurar e join AD em RHEL/Oracle Linux 8+ (moderno)"
+  hosts: linux_el8plus
+  gather_facts: false
+
+
+  tasks:
+    - name: Executar role el8plus
+      ansible.builtin.include_role:
+        name: el8plus
+
+- name: "Etapa 4 - Avisar SO não suportado"
+  hosts: linux_unsupported
+  gather_facts: false
+  tasks:
+    - name: Falhar para SO não suportado
+      ansible.builtin.fail:
+        msg: >-
+          SO não suportado por este playbook em {{ inventory_hostname }}
+          (esperado RHEL/OracleLinux 7 ou 8+). os_id={{ os_id | default('?') }}
+          os_major={{ os_major | default('?') }}

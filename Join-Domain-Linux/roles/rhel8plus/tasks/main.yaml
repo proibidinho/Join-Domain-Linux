@@ -1,0 +1,306 @@
+---
+# ============================================================================
+#  ROLE: rhel8plus  (RHEL 8/9 - SOMENTE Red Hat)
+#  - Registro no Satellite com tratativas para certificado e Python
+#  - Usa `command: dnf install` em vez do módulo dnf (não exige python3-dnf)
+#  - Bootstrap automático de python3-dnf via raw, caso outros módulos precisem
+#  - Validações: sshd -t/-T, visudo -c, authselect, realm/kinit/getent/id
+# ============================================================================
+
+# -------- Bootstrap (sem exigir python no alvo) ----------
+- name: "[RHEL8+] Bootstrap python3-dnf via raw (best-effort)"
+  ansible.builtin.raw: |
+    if ! /usr/bin/python3 -c 'import dnf' >/dev/null 2>&1; then
+      dnf install -y python3-dnf 2>/dev/null || yum install -y python3-dnf 2>/dev/null || true
+    fi
+  changed_when: false
+  failed_when: false
+
+- name: "[RHEL8+] Coletar facts mínimos"
+  ansible.builtin.setup:
+    gather_subset:
+      - '!all'
+      - '!min'
+      - distribution
+      - hostname
+      - date_time
+
+# ============================ SATELLITE / RHSM ==============================
+- name: "[RHEL8+] Limpar registro anterior (best-effort)"
+  ansible.builtin.shell: |
+    subscription-manager clean 2>/dev/null || true
+    subscription-manager unregister 2>/dev/null || true
+    subscription-manager remove --all 2>/dev/null || true
+    rm -rf /etc/rhsm/ca/* 2>/dev/null || true
+    rm -rf /var/cache/dnf 2>/dev/null || true
+  changed_when: false
+  failed_when: false
+
+- name: "[RHEL8+] Verificar katello-ca-consumer no Execution Node"
+  ansible.builtin.stat:
+    path: "{{ katello_ca_rpm_local }}"
+  register: katello_pkg
+  delegate_to: localhost
+  run_once: true
+
+- name: "[RHEL8+] Copiar katello-ca-consumer para o host"
+  ansible.builtin.copy:
+    src: "{{ katello_ca_rpm_local }}"
+    dest: /tmp/katello-ca-consumer-latest.noarch.rpm
+  when: katello_pkg.stat.exists
+
+- name: "[RHEL8+] Instalar katello-ca-consumer (ignora cert/assinatura)"
+  ansible.builtin.command: rpm -Uvh --force --nodigest --nosignature /tmp/katello-ca-consumer-latest.noarch.rpm
+  register: katello_install
+  changed_when: katello_install.rc == 0
+  failed_when: false
+  when: katello_pkg.stat.exists
+
+- name: "[RHEL8+] Registrar no Satellite (RHEL 8)"
+  ansible.builtin.command: >
+    subscription-manager register
+    --org={{ rhsm_org }}
+    --activationkey={{ rhsm_activation_key_rhel8 }}
+    --force
+  register: rhsm_reg
+  retries: 3
+  delay: 10
+  until: rhsm_reg.rc == 0
+  no_log: true
+  when: ansible_distribution_major_version == "8"
+
+- name: "[RHEL8+] Registrar no Satellite (RHEL 9)"
+  ansible.builtin.command: >
+    subscription-manager register
+    --org={{ rhsm_org }}
+    --activationkey={{ rhsm_activation_key_rhel9 }}
+    --force
+  register: rhsm_reg
+  retries: 3
+  delay: 10
+  until: rhsm_reg.rc == 0
+  no_log: true
+  when: ansible_distribution_major_version == "9"
+
+# ============================ SELINUX =======================================
+- name: "[RHEL8+] Desabilitar SELinux (runtime)"
+  ansible.builtin.command: setenforce 0
+  changed_when: false
+  failed_when: false
+
+- name: "[RHEL8+] Desabilitar SELinux (persistente)"
+  ansible.builtin.lineinfile:
+    path: /etc/selinux/config
+    regexp: '^SELINUX='
+    line: 'SELINUX=disabled'
+    create: true
+
+# ============================ FIREWALL ======================================
+- name: "[RHEL8+] Parar e desabilitar firewalld"
+  ansible.builtin.service:
+    name: firewalld
+    state: stopped
+    enabled: false
+  failed_when: false
+
+# =========================== PACOTES AD (via command, sem python3-dnf) ======
+- name: "[RHEL8+] Instalar pacotes AD via dnf CLI (resiliente)"
+  ansible.builtin.command: >
+    dnf install -y --setopt=tsflags=nodocs --skip-broken
+    realmd sssd sssd-tools oddjob oddjob-mkhomedir adcli
+    samba-common samba-common-tools krb5-workstation authselect
+  register: pkg_inst
+  retries: 3
+  delay: 10
+  until: pkg_inst.rc == 0
+  changed_when: "'Nothing to do' not in pkg_inst.stdout"
+
+# =========================== CYBERARK =======================================
+- name: "[RHEL8+] Obter credenciais CyberArk"
+  ansible.builtin.set_fact:
+    cyberark_creds: "{{ lookup('cyberark_claro') }}"
+  delegate_to: localhost
+  no_log: true
+
+# ============== VERIFICA SE JÁ ESTÁ NO DOMÍNIO ==============================
+- name: "[RHEL8+] Verificar realm atual"
+  ansible.builtin.command: realm list
+  register: realm_current
+  changed_when: false
+  failed_when: false
+
+# ============================= JOIN =========================================
+- name: "[RHEL8+] Remover keytab antigo se não estiver no domínio"
+  ansible.builtin.file:
+    path: /etc/krb5.keytab
+    state: absent
+  when: ad_domain not in (realm_current.stdout | default(''))
+
+- name: "[RHEL8+] Join no domínio (idempotente)"
+  ansible.builtin.shell:
+    cmd: >
+      echo {{ cyberark_creds.Content | quote }} |
+      /usr/sbin/adcli join --domain={{ ad_domain }}
+      --domain-controller={{ ad_dc }}
+      --login-user={{ cyberark_creds.UserName | quote }}
+      --stdin-password
+  register: join_result
+  retries: 3
+  delay: 15
+  until: join_result.rc == 0
+  when: ad_domain not in (realm_current.stdout | default(''))
+  no_log: true
+
+- name: "[RHEL8+] Aguardar replicação AD"
+  ansible.builtin.pause:
+    seconds: 15
+
+- name: "[RHEL8+] Validar que keytab foi criado"
+  ansible.builtin.stat:
+    path: /etc/krb5.keytab
+  register: keytab_stat
+  failed_when: not keytab_stat.stat.exists
+
+# =========================== TEMPLATES ======================================
+- name: "[RHEL8+] Configurar /etc/krb5.conf"
+  ansible.builtin.template:
+    src: krb5.conf.j2
+    dest: /etc/krb5.conf
+    owner: root
+    group: root
+    mode: '0644'
+    backup: true
+
+- name: "[RHEL8+] Configurar /etc/sssd/sssd.conf"
+  ansible.builtin.template:
+    src: sssd.conf.j2
+    dest: /etc/sssd/sssd.conf
+    owner: root
+    group: root
+    mode: '0600'
+    backup: true
+  notify: Restart sssd
+
+# ============================ SSHD (com sshd -t) ============================
+- name: "[RHEL8+] Backup sshd_config atual"
+  ansible.builtin.copy:
+    src: /etc/ssh/sshd_config
+    dest: "/etc/ssh/sshd_config.bkp.{{ ansible_date_time.epoch }}"
+    remote_src: true
+  changed_when: false
+
+- name: "[RHEL8+] Aplicar drop-in sshd corporativo (validado por sshd -t)"
+  ansible.builtin.template:
+    src: sshd_config.j2
+    dest: /etc/ssh/sshd_config.d/aap.conf
+    owner: root
+    group: root
+    mode: '0600'
+    validate: '/usr/sbin/sshd -t -f %s'
+  notify: Reload sshd
+
+- name: "[RHEL8+] Garantir Include /etc/ssh/sshd_config.d/*.conf"
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^Include /etc/ssh/sshd_config.d/\*\.conf'
+    line: 'Include /etc/ssh/sshd_config.d/*.conf'
+    create: true
+
+- name: "[RHEL8+] Validar config final do sshd (sshd -T)"
+  ansible.builtin.command: /usr/sbin/sshd -T
+  changed_when: false
+
+# ====================== SUDOERS (validate=visudo) ===========================
+- name: "[RHEL8+] Aplicar sudoers corporativo em /etc/sudoers.d/aap"
+  ansible.builtin.template:
+    src: sudoers.j2
+    dest: /etc/sudoers.d/aap
+    owner: root
+    group: root
+    mode: '0440'
+    validate: 'visudo -c -f %s'
+
+# ===================== AUTHSELECT + LIMPEZA SSSD + SERVIÇOS =================
+- name: "[RHEL8+] Parar sssd e limpar cache (evita 'could not initialize backend')"
+  ansible.builtin.shell: |
+    systemctl stop sssd 2>/dev/null || true
+    rm -rf /var/lib/sss/db/* 2>/dev/null || true
+    rm -rf /var/lib/sss/mc/* 2>/dev/null || true
+  changed_when: false
+  failed_when: false
+
+- name: "[RHEL8+] authselect check"
+  ansible.builtin.command: authselect check
+  register: authselect_check
+  changed_when: false
+  failed_when: false
+
+- name: "[RHEL8+] authselect apply-changes (se inconsistente)"
+  ansible.builtin.command: authselect apply-changes -b --backup=ansible-pre-sssd
+  when: authselect_check.rc != 0
+  changed_when: true
+  failed_when: false
+
+- name: "[RHEL8+] Ativar perfil sssd com mkhomedir"
+  ansible.builtin.command: authselect select sssd with-mkhomedir --force
+  changed_when: true
+
+- name: "[RHEL8+] Habilitar e iniciar serviços"
+  ansible.builtin.service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop:
+    - sssd
+    - oddjobd
+    - sshd
+
+- name: "[RHEL8+] Restart sssd para recarregar config"
+  ansible.builtin.service:
+    name: sssd
+    state: restarted
+
+- name: "[RHEL8+] Aguardar estabilização"
+  ansible.builtin.pause:
+    seconds: 10
+
+# =========================== VALIDAÇÕES AD ==================================
+- name: "[RHEL8+] realm list deve mostrar {{ ad_domain }}"
+  ansible.builtin.command: realm list
+  register: realm_after
+  changed_when: false
+  retries: 3
+  delay: 10
+  until: ad_domain in realm_after.stdout
+
+- name: "[RHEL8+] getent passwd do usuário AD"
+  ansible.builtin.command: "getent passwd {{ test_user }}@{{ ad_domain }}"
+  register: getent_test
+  retries: 5
+  delay: 10
+  until: getent_test.rc == 0
+  changed_when: false
+
+- name: "[RHEL8+] id do usuário AD"
+  ansible.builtin.command: "id {{ test_user }}@{{ ad_domain }}"
+  changed_when: false
+
+- name: "[RHEL8+] kinit do usuário (ccache isolado)"
+  ansible.builtin.shell: |
+    export KRB5CCNAME=FILE:/tmp/krb5cc_ansible_$$
+    kdestroy -A 2>/dev/null || true
+    echo {{ test_password | quote }} | kinit {{ test_user }}@{{ ad_domain | upper }}
+    rc=$?
+    kdestroy 2>/dev/null || true
+    exit $rc
+  register: kinit_test
+  changed_when: false
+  failed_when: kinit_test.rc != 0
+  no_log: true
+  when: test_password is defined and (test_password | length) > 0
+
+- name: "[RHEL8+] SUCESSO"
+  ansible.builtin.debug:
+    msg: >-
+      [RHEL8+] {{ inventory_hostname }} ({{ ansible_distribution }} {{ ansible_distribution_major_version }})
+      integrado ao {{ ad_domain }} | usuário {{ test_user }} validado (kinit + getent + id OK)

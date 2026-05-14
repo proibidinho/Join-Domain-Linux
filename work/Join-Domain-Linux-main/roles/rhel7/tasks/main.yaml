@@ -43,6 +43,8 @@
 
 - name: "[RHEL7] Instalacao do Katello"
   ansible.builtin.raw: yum localinstall -y /tmp/katello-ca-consumer-latest.noarch.rpm
+  
+  
 
 - name: "[RHEL7] Unregister + clean cache yum"
   ansible.builtin.raw: |
@@ -198,6 +200,7 @@
   changed_when: false
   failed_when: sshd_T.rc != 0
 
+
 # ====================== SUDOERS =======================
 
 - name: "[RHEL7] Garantir diretório sudoers.d"
@@ -242,7 +245,7 @@
 - name: "[RHEL7] Aguardar serviços estabilizarem"
   ansible.builtin.pause:
     seconds: 15
-
+    
 - name: "[RHEL7] Enable + restart serviços"
   ansible.builtin.raw: |
     systemctl enable realmd sssd oddjobd sshd 2>/dev/null || chkconfig sssd on || true

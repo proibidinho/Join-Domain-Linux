@@ -1,0 +1,249 @@
+---
+# ============================================================================
+#  ROLE: ol8plus  (Oracle Linux 8/9)
+#  - SEM Satellite/RHSM (Oracle Linux usa ULN ou repos públicos)
+#  - Usa `command: dnf install` em vez do módulo dnf (não exige python3-dnf)
+#  - Bootstrap automático de python3-dnf via raw, caso outros módulos precisem
+#  - Validações: sshd -t/-T, visudo -c, authselect, realm/kinit/getent/id
+# ============================================================================
+
+# -------- Bootstrap (sem exigir python no alvo) ----------
+- name: "[OL8+] Bootstrap python3-dnf via raw (best-effort)"
+  ansible.builtin.raw: |
+    if ! /usr/bin/python3 -c 'import dnf' >/dev/null 2>&1; then
+      dnf install -y python3-dnf 2>/dev/null || yum install -y python3-dnf 2>/dev/null || true
+    fi
+  changed_when: false
+  failed_when: false
+
+- name: "[OL8+] Coletar facts mínimos"
+  ansible.builtin.setup:
+    gather_subset:
+      - '!all'
+      - '!min'
+      - distribution
+      - hostname
+      - date_time
+
+# ============================ SELINUX =======================================
+- name: "[OL8+] Desabilitar SELinux (runtime)"
+  ansible.builtin.command: setenforce 0
+  changed_when: false
+  failed_when: false
+
+- name: "[OL8+] Desabilitar SELinux (persistente)"
+  ansible.builtin.lineinfile:
+    path: /etc/selinux/config
+    regexp: '^SELINUX='
+    line: 'SELINUX=disabled'
+    create: true
+
+# ============================ FIREWALL ======================================
+- name: "[OL8+] Parar e desabilitar firewalld"
+  ansible.builtin.service:
+    name: firewalld
+    state: stopped
+    enabled: false
+  failed_when: false
+
+# =========================== PACOTES AD (via command, sem python3-dnf) ======
+- name: "[OL8+] Instalar pacotes AD via dnf CLI (resiliente)"
+  ansible.builtin.command: >
+    dnf install -y --setopt=tsflags=nodocs --skip-broken
+    realmd sssd sssd-tools oddjob oddjob-mkhomedir adcli
+    samba-common samba-common-tools krb5-workstation authselect
+  register: pkg_inst
+  retries: 3
+  delay: 10
+  until: pkg_inst.rc == 0
+  changed_when: "'Nothing to do' not in pkg_inst.stdout"
+
+# =========================== CYBERARK =======================================
+- name: "[OL8+] Obter credenciais CyberArk"
+  ansible.builtin.set_fact:
+    cyberark_creds: "{{ lookup('cyberark_claro') }}"
+  delegate_to: localhost
+  no_log: true
+
+# ============== VERIFICA SE JÁ ESTÁ NO DOMÍNIO ==============================
+- name: "[OL8+] Verificar realm atual"
+  ansible.builtin.command: realm list
+  register: realm_current
+  changed_when: false
+  failed_when: false
+
+# ============================= JOIN =========================================
+- name: "[OL8+] Remover keytab antigo se não estiver no domínio"
+  ansible.builtin.file:
+    path: /etc/krb5.keytab
+    state: absent
+  when: ad_domain not in (realm_current.stdout | default(''))
+
+- name: "[OL8+] Join no domínio (idempotente)"
+  ansible.builtin.shell:
+    cmd: >
+      echo {{ cyberark_creds.Content | quote }} |
+      /usr/sbin/adcli join --domain={{ ad_domain }}
+      --domain-controller={{ ad_dc }}
+      --login-user={{ cyberark_creds.UserName | quote }}
+      --stdin-password
+  register: join_result
+  retries: 3
+  delay: 15
+  until: join_result.rc == 0
+  when: ad_domain not in (realm_current.stdout | default(''))
+  no_log: true
+
+- name: "[OL8+] Aguardar replicação AD"
+  ansible.builtin.pause:
+    seconds: 15
+
+- name: "[OL8+] Validar que keytab foi criado"
+  ansible.builtin.stat:
+    path: /etc/krb5.keytab
+  register: keytab_stat
+  failed_when: not keytab_stat.stat.exists
+
+# =========================== TEMPLATES ======================================
+- name: "[OL8+] Configurar /etc/krb5.conf"
+  ansible.builtin.template:
+    src: krb5.conf.j2
+    dest: /etc/krb5.conf
+    owner: root
+    group: root
+    mode: '0644'
+    backup: true
+
+- name: "[OL8+] Configurar /etc/sssd/sssd.conf"
+  ansible.builtin.template:
+    src: sssd.conf.j2
+    dest: /etc/sssd/sssd.conf
+    owner: root
+    group: root
+    mode: '0600'
+    backup: true
+  notify: Restart sssd
+
+# ============================ SSHD (com sshd -t) ============================
+- name: "[OL8+] Backup sshd_config atual"
+  ansible.builtin.copy:
+    src: /etc/ssh/sshd_config
+    dest: "/etc/ssh/sshd_config.bkp.{{ ansible_date_time.epoch }}"
+    remote_src: true
+  changed_when: false
+
+- name: "[OL8+] Aplicar drop-in sshd corporativo (validado por sshd -t)"
+  ansible.builtin.template:
+    src: sshd_config.j2
+    dest: /etc/ssh/sshd_config.d/aap.conf
+    owner: root
+    group: root
+    mode: '0600'
+    validate: '/usr/sbin/sshd -t -f %s'
+  notify: Reload sshd
+
+- name: "[OL8+] Garantir Include /etc/ssh/sshd_config.d/*.conf"
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^Include /etc/ssh/sshd_config.d/\*\.conf'
+    line: 'Include /etc/ssh/sshd_config.d/*.conf'
+    create: true
+
+- name: "[OL8+] Validar config final do sshd (sshd -T)"
+  ansible.builtin.command: /usr/sbin/sshd -T
+  changed_when: false
+
+# ====================== SUDOERS (validate=visudo) ===========================
+- name: "[OL8+] Aplicar sudoers corporativo em /etc/sudoers.d/aap"
+  ansible.builtin.template:
+    src: sudoers.j2
+    dest: /etc/sudoers.d/aap
+    owner: root
+    group: root
+    mode: '0440'
+    validate: 'visudo -c -f %s'
+
+# ===================== AUTHSELECT + LIMPEZA SSSD + SERVIÇOS =================
+- name: "[OL8+] Parar sssd e limpar cache (evita 'could not initialize backend')"
+  ansible.builtin.shell: |
+    systemctl stop sssd 2>/dev/null || true
+    rm -rf /var/lib/sss/db/* 2>/dev/null || true
+    rm -rf /var/lib/sss/mc/* 2>/dev/null || true
+  changed_when: false
+  failed_when: false
+
+- name: "[OL8+] authselect check"
+  ansible.builtin.command: authselect check
+  register: authselect_check
+  changed_when: false
+  failed_when: false
+
+- name: "[OL8+] authselect apply-changes (se inconsistente)"
+  ansible.builtin.command: authselect apply-changes -b --backup=ansible-pre-sssd
+  when: authselect_check.rc != 0
+  changed_when: true
+  failed_when: false
+
+- name: "[OL8+] Ativar perfil sssd com mkhomedir"
+  ansible.builtin.command: authselect select sssd with-mkhomedir --force
+  changed_when: true
+
+- name: "[OL8+] Habilitar e iniciar serviços"
+  ansible.builtin.service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop:
+    - sssd
+    - oddjobd
+    - sshd
+
+- name: "[OL8+] Restart sssd para recarregar config"
+  ansible.builtin.service:
+    name: sssd
+    state: restarted
+
+- name: "[OL8+] Aguardar estabilização"
+  ansible.builtin.pause:
+    seconds: 10
+
+# =========================== VALIDAÇÕES AD ==================================
+- name: "[OL8+] realm list deve mostrar {{ ad_domain }}"
+  ansible.builtin.command: realm list
+  register: realm_after
+  changed_when: false
+  retries: 3
+  delay: 10
+  until: ad_domain in realm_after.stdout
+
+- name: "[OL8+] getent passwd do usuário AD"
+  ansible.builtin.command: "getent passwd {{ test_user }}@{{ ad_domain }}"
+  register: getent_test
+  retries: 5
+  delay: 10
+  until: getent_test.rc == 0
+  changed_when: false
+
+- name: "[OL8+] id do usuário AD"
+  ansible.builtin.command: "id {{ test_user }}@{{ ad_domain }}"
+  changed_when: false
+
+- name: "[OL8+] kinit do usuário (ccache isolado)"
+  ansible.builtin.shell: |
+    export KRB5CCNAME=FILE:/tmp/krb5cc_ansible_$$
+    kdestroy -A 2>/dev/null || true
+    echo {{ test_password | quote }} | kinit {{ test_user }}@{{ ad_domain | upper }}
+    rc=$?
+    kdestroy 2>/dev/null || true
+    exit $rc
+  register: kinit_test
+  changed_when: false
+  failed_when: kinit_test.rc != 0
+  no_log: true
+  when: test_password is defined and (test_password | length) > 0
+
+- name: "[OL8+] SUCESSO"
+  ansible.builtin.debug:
+    msg: >-
+      [OL8+] {{ inventory_hostname }} ({{ ansible_distribution }} {{ ansible_distribution_major_version }})
+      integrado ao {{ ad_domain }} | usuário {{ test_user }} validado (kinit + getent + id OK)

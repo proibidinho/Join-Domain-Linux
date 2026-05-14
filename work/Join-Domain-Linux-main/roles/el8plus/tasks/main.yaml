@@ -1,0 +1,293 @@
+---
+# ============================================================================
+#  ROLE: el8plus  (RHEL / Oracle Linux 8+ - MODERNO)
+#  - Usa módulos nativos (dnf, template, service, selinux, copy, file...)
+#  - RHSM somente quando ansible_distribution == 'RedHat'
+#  - Validações: sshd -t/-T, visudo -c (via template validate),
+#    authselect check, realm list, kinit, getent, id
+# ============================================================================
+
+- name: "[EL8+] Coletar facts mínimos"
+  ansible.builtin.setup:
+    gather_subset:
+      - 'all'
+
+# ============== SUBSCRIPTION MANAGER (somente RHEL) =========================
+- name: "[EL8+] Bloco RHSM (RHEL apenas)"
+  when: ansible_distribution == 'RedHat'
+  block:
+    - name: "[EL8+] subscription-manager clean"
+      ansible.builtin.command: subscription-manager clean
+      changed_when: false
+      failed_when: false
+
+    - name: "[EL8+] subscription-manager unregister"
+      ansible.builtin.command: subscription-manager unregister
+      changed_when: false
+      failed_when: false
+
+    - name: "[EL8+] subscription-manager refresh"
+      ansible.builtin.command: subscription-manager refresh
+      changed_when: false
+      failed_when: false
+
+    - name: Garantir que instalador katello está no Execution Node
+      ansible.builtin.stat:
+        path: /tmp/katello-ca-consumer-latest.noarch.rpm
+      register: instalador_exec_node
+      delegate_to: localhost
+      run_once: true
+
+    - name: Copiando o katello pra ca
+      ansible.builtin.copy:
+        src: /tmp/katello-ca-consumer-latest.noarch.rpm
+        dest: /tmp/
+      when: instalador_exec_node.stat.exists
+
+    - name: Instalando katello local
+      ansible.builtin.command: rpm -Uvh /tmp/katello-ca-consumer-latest.noarch.rpm
+      register: resultado_instala_katello
+      failed_when: not resultado_instala_katello.rc == "0" or resultado_instala_katello.rc == "1"
+      
+
+
+    - name: "[EL8] Registrar no Red Hat (RHSM)"
+      ansible.builtin.command: subscription-manager register --org="CLAROBR" --activationkey="AK-RHEL8"
+      register: rhsm_register
+      retries: 3
+      delay: 10
+      until: rhsm_register.rc == 0
+      no_log: true
+      when: ansible_distribution_major == "8"
+
+    - name: "[EL9] Registrar no Red Hat (RHSM)"
+      ansible.builtin.command: subscription-manager register --org="CLAROBR" --activationkey="AK-RHEL9"
+      register: rhsm_register
+      retries: 3
+      delay: 10
+      until: rhsm_register.rc == 0
+      no_log: true
+      when: ansible_distribution_major == "9"
+  # vars:
+  #   ansible_python_interpreter: /usr/libexec/platform-python
+# ============================ SELINUX =======================================
+- name: "[EL8+] Desabilitar SELinux (persistente)"
+  ansible.posix.selinux:
+    state: disabled
+
+- name: "[EL8+] Desabilitar SELinux (runtime)"
+  ansible.builtin.command: setenforce 0
+  changed_when: false
+  failed_when: false
+
+# ============================ FIREWALL ======================================
+- name: "[EL8+] Parar e desabilitar firewalld"
+  ansible.builtin.service:
+    name: firewalld
+    state: stopped
+    enabled: false
+  failed_when: false
+
+# =========================== PACOTES AD =====================================
+- name: "[EL8+] Instalar pacotes realmd/sssd/adcli/authselect"
+  ansible.builtin.dnf:
+    name:
+      - realmd
+      - sssd
+      - sssd-tools
+      - oddjob
+      - oddjob-mkhomedir
+      - adcli
+      - samba-common
+      - samba-common-tools
+      - krb5-workstation
+      - authselect
+    state: present
+
+# =========================== CYBERARK =======================================
+- name: "[EL8+] Obter credenciais CyberArk"
+  ansible.builtin.set_fact:
+    cyberark_creds: "{{ lookup('cyberark_claro') }}"
+  delegate_to: localhost
+  no_log: true
+
+# ============== VERIFICA SE JÁ ESTÁ NO DOMÍNIO ==============================
+- name: "[EL8+] Verificar realm atual"
+  ansible.builtin.command: realm list
+  register: realm_current
+  changed_when: false
+
+# ============================= JOIN =========================================
+- name: "[EL8+] Join no domínio (idempotente)"
+  ansible.builtin.shell:
+    cmd: >
+      echo {{ cyberark_creds.Content | quote }} |
+      /usr/sbin/adcli join --domain={{ ad_domain }}
+      --domain-controller={{ ad_dc }}
+      --login-user={{ cyberark_creds.UserName | quote }}
+      --stdin-password
+  register: join_result
+  retries: 3
+  delay: 15
+  until: join_result.rc == 0
+  when: ad_domain not in realm_current.stdout
+  no_log: true
+
+- name: "[EL8+] Aguardar replicação AD"
+  ansible.builtin.pause:
+    seconds: 15
+
+# =========================== TEMPLATES ======================================
+- name: "[EL8+] Configurar /etc/krb5.conf"
+  ansible.builtin.template:
+    src: krb5.conf.j2
+    dest: /etc/krb5.conf
+    owner: root
+    group: root
+    mode: '0644'
+    backup: true
+
+- name: "[EL8+] Configurar /etc/sssd/sssd.conf"
+  ansible.builtin.template:
+    src: sssd.conf.j2
+    dest: /etc/sssd/sssd.conf
+    owner: root
+    group: root
+    mode: '0600'
+    backup: true
+  notify: Restart sssd
+
+# ======================== sshd_config (sshd -t) =============================
+- name: Backup sshd_config
+  ansible.builtin.copy:
+    src: /etc/ssh/sshd_config
+    dest: "/etc/ssh/sshd_config.bkp.{{ ansible_date_time.epoch }}"
+    remote_src: yes
+  changed_when: false
+
+- name: Aplicar template sshd_config corporativo
+  ansible.builtin.template:
+    src: sshd_config.j2
+    dest: /etc/ssh/sshd_config.d/aap.conf
+    owner: root
+    group: root
+    mode: '0600'
+    validate: '/usr/sbin/sshd -t -f %s'
+
+- name: Garantir include no sshd_config principal
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^Include /etc/ssh/sshd_config.d/\*\.conf'
+    line: 'Include /etc/ssh/sshd_config.d/*.conf'
+    create: yes
+    validate: '/usr/sbin/sshd -t -f %s'
+
+- name: Validar runtime sshd
+  ansible.builtin.command: /usr/sbin/sshd -T
+  changed_when: false
+
+# ================= SUDOERS =================
+
+- name: Garantir diretório sudoers.d
+  ansible.builtin.file:
+    path: /etc/sudoers.d
+    state: directory
+    mode: '0755'
+
+- name: Garantir include do sudoers.d
+  ansible.builtin.lineinfile:
+    path: /etc/sudoers
+    regexp: '^#includedir /etc/sudoers.d'
+    line: '#includedir /etc/sudoers.d'
+    validate: 'visudo -c -f %s'
+
+- name: Aplicar template sudoers corporativo
+  ansible.builtin.template:
+    src: sudoers.j2
+    dest: /etc/sudoers.d/aap
+    owner: root
+    group: root
+    mode: '0440'
+    validate: 'visudo -c -f %s'
+
+# ===================== AUTHSELECT + RESTART SERVIÇOS ========================
+- name: "[EL8+] authselect check"
+  ansible.builtin.command: authselect check
+  register: authselect_check
+  changed_when: false
+  failed_when: false
+
+- name: "[EL8+] authselect apply-changes (se inconsistente)"
+  ansible.builtin.command: authselect apply-changes -b --backup=ansible-pre-sssd
+  when: authselect_check.rc != 0
+  changed_when: true
+  failed_when: false
+
+- name: "[EL8+] Ativar perfil sssd com mkhomedir"
+  ansible.builtin.command: authselect select sssd with-mkhomedir --force
+  changed_when: true
+
+- name: "[EL8+] Habilitar e iniciar serviços"
+  ansible.builtin.service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop:
+    - sssd
+    - oddjobd
+    - sshd
+
+- name: "[EL8+] Aguardar estabilização"
+  ansible.builtin.pause:
+    seconds: 10
+
+- name: "[EL8+] Restart sssd para recarregar config"
+  ansible.builtin.service:
+    name: sssd
+    state: restarted
+
+- name: "[EL8+] Aguardar estabilização"
+  ansible.builtin.pause:
+    seconds: 10
+
+# =========================== VALIDAÇÕES AD ==================================
+- name: "[EL8+] realm list deve mostrar {{ ad_domain }}"
+  ansible.builtin.command: realm list
+  register: realm_after
+  changed_when: false
+  retries: 3
+  delay: 10
+  until: ad_domain in realm_after.stdout
+
+- name: "[EL8+] getent passwd do usuário AD"
+  ansible.builtin.command: "getent passwd {{ test_user }}@{{ ad_domain }}"
+  register: getent_test
+  retries: 5
+  delay: 10
+  until: getent_test.rc == 0
+  changed_when: false
+
+- name: "[EL8+] id do usuário AD"
+  ansible.builtin.command: "id {{ test_user }}@{{ ad_domain }}"
+  register: id_test
+  changed_when: false
+
+- name: "[EL8+] kinit do usuário (validar Kerberos)"
+  ansible.builtin.shell:
+    cmd: "echo {{ test_password | quote }} | kinit {{ test_user }}@{{ ad_domain | upper }}"
+  register: kinit_test
+  changed_when: false
+  failed_when: kinit_test.rc != 0
+  no_log: true
+  when: test_password is defined and (test_password | length) > 0
+
+- name: "[EL8+] Limpar ticket kerberos"
+  ansible.builtin.command: kdestroy
+  changed_when: false
+  failed_when: false
+
+- name: "[EL8+] SUCESSO"
+  ansible.builtin.debug:
+    msg: >-
+      [EL8+] {{ inventory_hostname }} ({{ ansible_distribution }} {{ ansible_distribution_major_version }})
+      integrado ao {{ ad_domain }} | usuário {{ test_user }} validado (kinit + getent + id OK)

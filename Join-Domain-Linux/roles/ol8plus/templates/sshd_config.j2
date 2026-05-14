@@ -1,0 +1,11 @@
+# Drop-in corporativo - /etc/ssh/sshd_config.d/aap.conf
+# Gerado por Ansible (role ol8plus). Validado por: sshd -t -f
+PermitRootLogin yes
+PasswordAuthentication yes
+ChallengeResponseAuthentication no
+GSSAPIAuthentication yes
+GSSAPICleanupCredentials no
+UsePAM yes
+X11Forwarding yes
+PrintMotd no
+AllowGroups wheel root PS_crk_aap_admin PScrkaapadmin

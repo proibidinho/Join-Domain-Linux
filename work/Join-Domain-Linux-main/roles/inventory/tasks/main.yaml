@@ -1,3 +1,4 @@
+---
 - name: Adiciona servidores ao grupo unix
   ansible.builtin.add_host:
     name: "{{ item | trim }}"
