@@ -2,47 +2,17 @@
 # ============================================================================
 #  ROLE: rhel7  (RHEL 7 - LEGADO - SOMENTE `raw`)
 #  - Não assume Python no alvo
-#  - Inclui registro no RHSM, SELinux, firewall, pacotes AD, CyberArk,
-#    join idempotente, templates, validações (sshd -t/-T, visudo -c,
-#    realm list, kinit, getent, id) e restart/health dos serviços.
+#  - sshd_config: NÃO substitui o arquivo. Remove apenas as diretivas AD
+#    existentes (comentadas ou não) e adiciona um bloco delimitado no final.
+#  - sudoers: NÃO toca /etc/sudoers. Cria drop-in /etc/sudoers.d/aap.
+#  - password-auth-ac / system-auth-ac: o `authconfig` cuida automaticamente
+#    (não escrevemos manualmente).
 # ============================================================================
 
 # =================== SUBSCRIPTION MANAGER (RHEL 7) ==========================
 - name: "[RHEL7] Limpar subscription-manager"
   ansible.builtin.raw: subscription-manager clean || true
   changed_when: false
-
-- name: Garantir que instalador katello está no Execution Node
-  ansible.builtin.stat:
-    path: /tmp/katello-ca-consumer-latest.noarch.rpm
-  register: instalador_exec_node
-  delegate_to: localhost
-  run_once: true
-
-# - name: Copiando o katello pra ca
-#   ansible.builtin.copy:
-#     src: /tmp/katello-ca-consumer-latest.noarch.rpm
-#     dest: /tmp/
-#   when: instalador_exec_node.stat.exists
-#   #delegate_to: localhost
-
-- name: Verificar se RPM já existe
-  raw: test -f /tmp/katello-ca-consumer-latest.noarch.rpm
-  register: rpm_exists
-  failed_when: false
-  changed_when: false
-
-- name: Enviar RPM se não existir
-  raw: |
-    cat << 'EOF' > /tmp/katello-ca-consumer-latest.noarch.rpm.b64
-    {{ lookup('pipe', 'base64 -w 0 /tmp/katello-ca-consumer-latest.noarch.rpm') }}
-    EOF
-    base64 -d /tmp/katello-ca-consumer-latest.noarch.rpm.b64 > /tmp/katello-ca-consumer-latest.noarch.rpm
-    rm -f /tmp/katello-ca-consumer-latest.noarch.rpm.b64
-  when: rpm_exists.rc != 0
-
-- name: "[RHEL7] Instalacao do Katello"
-  ansible.builtin.raw: yum localinstall -y /tmp/katello-ca-consumer-latest.noarch.rpm
 
 - name: "[RHEL7] Unregister + clean cache yum"
   ansible.builtin.raw: |
@@ -55,15 +25,17 @@
   changed_when: false
 
 - name: "[RHEL7] Registrar no Red Hat (RHSM)"
-  raw: |
+  ansible.builtin.raw: |
     subscription-manager register \
-    --org="CLAROBR" \
-    --activationkey="AK-RHEL7"
+      --username={{ rhsm_user | quote }} \
+      --password={{ rhsm_pass | quote }} \
+      --name=$(hostname) \
+      --force --auto-attach --insecure
   register: rhsm_register
-  # retries: 5
-  # delay: 15
-  # until: rhsm_register.rc == 0
-  #no_log: true
+  retries: 3
+  delay: 10
+  until: rhsm_register.rc == 0
+  no_log: true
 
 # ============================ SELINUX =======================================
 - name: "[RHEL7] SELinux runtime permissive"
@@ -90,8 +62,7 @@
 - name: "[RHEL7] Instalar pacotes realmd/sssd/adcli/authconfig"
   ansible.builtin.raw: |
     yum install -y realmd sssd sssd-tools oddjob oddjob-mkhomedir adcli \
-      samba-common samba-common-tools krb5-workstation \
-      authconfig
+      samba-common samba-common-tools krb5-workstation authconfig
   register: pkg_inst
   retries: 3
   delay: 10
@@ -111,6 +82,11 @@
   changed_when: false
 
 # ============================= JOIN =========================================
+- name: "[RHEL7] Remover keytab antigo se não estiver no domínio"
+  ansible.builtin.raw: rm -f /etc/krb5.keytab
+  when: domain_check.stdout | trim == ''
+  changed_when: true
+
 - name: "[RHEL7] Join no domínio (idempotente)"
   ansible.builtin.raw: |
     echo {{ cyberark_creds.Content | quote }} | /usr/sbin/adcli join \
@@ -129,7 +105,15 @@
   ansible.builtin.pause:
     seconds: 15
 
-# ====================== TEMPLATES (heredoc via raw) =========================
+- name: "[RHEL7] Validar que keytab foi criado"
+  ansible.builtin.raw: test -s /etc/krb5.keytab
+  register: keytab_check
+  changed_when: false
+  failed_when: keytab_check.rc != 0
+
+# ====================== krb5.conf e sssd.conf (heredoc) =====================
+# Estes 2 arquivos SÃO arquivos exclusivos do AD/SSSD e podem ser sobrescritos
+# integralmente sem perder configurações de outras stacks.
 - name: "[RHEL7] Renderizar /etc/krb5.conf"
   ansible.builtin.raw: |
     cat > /etc/krb5.conf << 'EOF_KRB5'
@@ -148,111 +132,106 @@
     chmod 0600 /etc/sssd/sssd.conf
   changed_when: true
 
-- name: "[RHEL7] Renderizar /etc/pam.d/password-auth-ac"
+# ============== sshd_config: MERGE cirúrgico (preserva o resto) =============
+# Estratégia:
+#   1) Backup com timestamp
+#   2) Remove TODAS as ocorrências (com e sem comentário) das diretivas que
+#      vamos gerenciar - assim evitamos conflito de "first match wins"
+#   3) Remove bloco antigo gerenciado pelo Ansible, se existir
+#   4) Adiciona bloco delimitado no FIM do arquivo
+#   5) Valida com sshd -t e só substitui se passar
+- name: "[RHEL7] Aplicar bloco AD no sshd_config (merge sem substituir)"
   ansible.builtin.raw: |
-    cat > /etc/pam.d/password-auth-ac << 'EOF_PAM1'
-    {{ lookup('template', 'password-auth-ac.j2') }}
-    EOF_PAM1
-    chmod 0644 /etc/pam.d/password-auth-ac
+    set -e
+    SRC=/etc/ssh/sshd_config
+    NEW=/etc/ssh/sshd_config.new
+    cp -f "$SRC" "${SRC}.bkp.$(date +%s)"
+    cp -f "$SRC" "$NEW"
+    # 1) Remover diretivas gerenciadas (comentadas ou não)
+    for k in PermitRootLogin PasswordAuthentication ChallengeResponseAuthentication \
+             GSSAPIAuthentication GSSAPICleanupCredentials UsePAM PrintMotd AllowGroups; do
+      sed -i -E "/^[[:space:]]*#?[[:space:]]*${k}([[:space:]]|$)/d" "$NEW"
+    done
+    # 2) Remover bloco antigo gerenciado
+    sed -i '/# BEGIN ANSIBLE-AD/,/# END ANSIBLE-AD/d' "$NEW"
+    # 3) Adicionar bloco novo no final
+    cat >> "$NEW" << 'EOF_SSHD_AD'
+
+    # BEGIN ANSIBLE-AD (gerenciado pelo playbook - NAO EDITAR MANUALMENTE)
+    PermitRootLogin yes
+    PasswordAuthentication yes
+    ChallengeResponseAuthentication no
+    GSSAPIAuthentication yes
+    GSSAPICleanupCredentials no
+    UsePAM yes
+    PrintMotd no
+    AllowGroups {{ sshd_allowgroups }}
+    # END ANSIBLE-AD
+    EOF_SSHD_AD
+    # 4) Validar e aplicar
+    /usr/sbin/sshd -t -f "$NEW"
+    install -o root -g root -m 0600 "$NEW" "$SRC"
+    rm -f "$NEW"
+  register: sshd_merge
   changed_when: true
+  failed_when: sshd_merge.rc != 0
 
-- name: "[RHEL7] Renderizar /etc/pam.d/system-auth-ac"
-  ansible.builtin.raw: |
-    cat > /etc/pam.d/system-auth-ac << 'EOF_PAM2'
-    {{ lookup('template', 'system-auth-ac.j2') }}
-    EOF_PAM2
-    chmod 0644 /etc/pam.d/system-auth-ac
-  changed_when: true
-
-# ================= SSHD =================
-
-- name: "[RHEL7] Backup sshd_config"
-  raw: cp -f /etc/ssh/sshd_config /etc/ssh/sshd_config.bkp.aap 2>/dev/null || true
-  changed_when: false
-
-- name: "[RHEL7] Garantir configurações no sshd_config"
-  raw: |
-    FILE=/etc/ssh/sshd_config
-
-    grep -q "^PermitRootLogin" $FILE && \
-      sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' $FILE || \
-      echo "PermitRootLogin no" >> $FILE
-
-    grep -q "^PasswordAuthentication" $FILE && \
-      sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/' $FILE || \
-      echo "PasswordAuthentication yes" >> $FILE
-
-    grep -q "^UsePAM" $FILE && \
-      sed -i 's/^UsePAM.*/UsePAM yes/' $FILE || \
-      echo "UsePAM yes" >> $FILE
-
-- name: "[RHEL7] Validar sshd_config"
-  raw: /usr/sbin/sshd -t
-  register: sshd_test
-  changed_when: false
-  failed_when: sshd_test.rc != 0
-
-- name: "[RHEL7] Validar config em runtime"
-  raw: /usr/sbin/sshd -T > /dev/null
+- name: "[RHEL7] Validar config final do sshd (sshd -T)"
+  ansible.builtin.raw: /usr/sbin/sshd -T >/dev/null
   register: sshd_T
   changed_when: false
   failed_when: sshd_T.rc != 0
 
-# ====================== SUDOERS =======================
-
-- name: "[RHEL7] Garantir diretório sudoers.d"
-  raw: |
-    mkdir -p /etc/sudoers.d
-    chmod 755 /etc/sudoers.d
-
-- name: "[RHEL7] Garantir include do sudoers.d"
-  raw: |
-    grep -q "^#includedir /etc/sudoers.d" /etc/sudoers || \
-    echo "#includedir /etc/sudoers.d" >> /etc/sudoers
-
-- name: "[RHEL7] Renderizar template sudoers em arquivo temporário"
-  raw: |
-    cat << 'EOF' > /tmp/aap_sudoers
-    {{ lookup('template', 'sudoers.j2') }}
-    EOF
-    chmod 0440 /tmp/aap_sudoers
-
-- name: "[RHEL7] Validar sudoers completo"
-  raw: visudo -c -f /tmp/aap_sudoers
-  register: sudo_check
-
-- name: "[RHEL7] Aplicar sudoers.d (idempotente)"
-  raw: |
-    DEST=/etc/sudoers.d/aap
-
-    # só atualiza se mudou
-    if [ ! -f "$DEST" ] || ! cmp -s /tmp/aap_sudoers $DEST; then
-      cp /tmp/aap_sudoers $DEST
-      chmod 0440 $DEST
+# ============== sudoers: drop-in /etc/sudoers.d/aap (não toca /etc/sudoers) =
+- name: "[RHEL7] Garantir includedir em /etc/sudoers"
+  ansible.builtin.raw: |
+    if ! grep -q "^#includedir /etc/sudoers.d" /etc/sudoers; then
+      cp -f /etc/sudoers /etc/sudoers.bkp.$(date +%s)
+      cp -f /etc/sudoers /tmp/sudoers.new
+      echo "" >> /tmp/sudoers.new
+      echo "#includedir /etc/sudoers.d" >> /tmp/sudoers.new
+      visudo -c -f /tmp/sudoers.new && install -o root -g root -m 0440 /tmp/sudoers.new /etc/sudoers
+      rm -f /tmp/sudoers.new
     fi
+  changed_when: true
 
-    rm -f /tmp/aap_sudoers
-  when: sudo_check.rc == 0
+- name: "[RHEL7] Criar drop-in /etc/sudoers.d/aap"
+  ansible.builtin.raw: |
+    install -d -m 0750 -o root -g root /etc/sudoers.d
+    cat > /tmp/sudoers.d.aap << 'EOF_SUDO_AAP'
+    # Drop-in corporativo gerenciado pelo Ansible (role rhel7)
+    Defaults!ALL    !visiblepw, always_set_home, match_group_by_gid, always_query_group_plugin
+    svc_aap         ALL=(ALL)   NOPASSWD: ALL
+    EOF_SUDO_AAP
+    visudo -c -f /tmp/sudoers.d.aap
+    install -o root -g root -m 0440 /tmp/sudoers.d.aap /etc/sudoers.d/aap
+    rm -f /tmp/sudoers.d.aap
+  register: sudo_dropin
+  changed_when: true
+  failed_when: sudo_dropin.rc != 0
 
 # ====================== authconfig + restart serviços =======================
+# authconfig gera/atualiza /etc/pam.d/{password,system}-auth-ac automaticamente
 - name: "[RHEL7] Habilitar sssd + mkhomedir via authconfig"
   ansible.builtin.raw: authconfig --enablesssd --enablesssdauth --enablemkhomedir --update
   changed_when: true
 
-- name: "[RHEL7] Aguardar serviços estabilizarem"
-  ansible.builtin.pause:
-    seconds: 15
+- name: "[RHEL7] Limpar cache SSSD antes do restart"
+  ansible.builtin.raw: |
+    systemctl stop sssd 2>/dev/null || service sssd stop 2>/dev/null || true
+    rm -rf /var/lib/sss/db/* /var/lib/sss/mc/* 2>/dev/null || true
+  changed_when: false
 
-- name: "[RHEL7] Enable + restart serviços"
+- name: "[RHEL7] Enable + start serviços"
   ansible.builtin.raw: |
     systemctl enable realmd sssd oddjobd sshd 2>/dev/null || chkconfig sssd on || true
-    systemctl restart sssd oddjobd 2>/dev/null || service sssd restart || true
+    systemctl start sssd oddjobd 2>/dev/null || service sssd start || true
     systemctl reload sshd 2>/dev/null || service sshd reload || true
   changed_when: true
 
 - name: "[RHEL7] Aguardar serviços estabilizarem"
   ansible.builtin.pause:
-    seconds: 15
+    seconds: 5
 
 - name: "[RHEL7] Status do sssd"
   ansible.builtin.raw: |
@@ -278,8 +257,14 @@
   changed_when: false
   failed_when: realm_after.rc != 0
 
-- name: "[RHEL7] kinit do usuário de teste"
-  ansible.builtin.raw: echo {{ test_password | quote }} | kinit {{ test_user }}@{{ ad_domain | upper }}
+- name: "[RHEL7] kinit do usuário (ccache isolado)"
+  ansible.builtin.raw: |
+    export KRB5CCNAME=FILE:/tmp/krb5cc_ansible_$$
+    kdestroy -A 2>/dev/null || true
+    echo {{ test_password | quote }} | kinit {{ test_user }}@{{ ad_domain | upper }}
+    rc=$?
+    kdestroy 2>/dev/null || true
+    exit $rc
   register: kinit_test
   changed_when: false
   failed_when: kinit_test.rc != 0
@@ -300,10 +285,6 @@
   register: id_test
   changed_when: false
   failed_when: id_test.rc != 0
-
-- name: "[RHEL7] Limpar ticket kerberos"
-  ansible.builtin.raw: kdestroy 2>/dev/null || true
-  changed_when: false
 
 - name: "[RHEL7] SUCESSO"
   ansible.builtin.debug:

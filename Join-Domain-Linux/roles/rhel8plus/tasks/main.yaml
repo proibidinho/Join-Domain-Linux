@@ -43,11 +43,20 @@
   delegate_to: localhost
   run_once: true
 
-- name: "[RHEL8+] Copiar katello-ca-consumer para o host"
-  ansible.builtin.copy:
-    src: "{{ katello_ca_rpm_local }}"
-    dest: /tmp/katello-ca-consumer-latest.noarch.rpm
+- name: "[RHEL8+] Codificar katello-ca-consumer em base64 (no controller)"
+  ansible.builtin.set_fact:
+    katello_b64: "{{ lookup('file', katello_ca_rpm_local) | b64encode }}"
+  delegate_to: localhost
+  run_once: true
   when: katello_pkg.stat.exists
+  no_log: true
+
+- name: "[RHEL8+] Reconstruir katello-ca-consumer no host via base64 (sem módulo copy)"
+  ansible.builtin.shell: |
+    echo '{{ katello_b64 }}' | base64 -d > /tmp/katello-ca-consumer-latest.noarch.rpm
+  when: katello_pkg.stat.exists
+  changed_when: true
+  no_log: true
 
 - name: "[RHEL8+] Instalar katello-ca-consumer (ignora cert/assinatura)"
   ansible.builtin.command: rpm -Uvh --force --nodigest --nosignature /tmp/katello-ca-consumer-latest.noarch.rpm
