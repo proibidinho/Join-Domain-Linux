@@ -8,10 +8,22 @@
 # ============================================================================
 
 # -------- Bootstrap (sem exigir python no alvo) ----------
-- name: "[RHEL8+] Bootstrap python3-dnf via raw (best-effort)"
+- name: "[RHEL8+] Bootstrap Python 3 + python3-dnf via raw (compat máxima)"
   ansible.builtin.raw: |
-    if ! /usr/bin/python3 -c 'import dnf' >/dev/null 2>&1; then
-      dnf install -y python3-dnf 2>/dev/null || yum install -y python3-dnf 2>/dev/null || true
+    # Tenta múltiplos interpretadores. Em RHEL 8 minimal pode faltar python3.
+    if ! command -v python3 >/dev/null 2>&1 \
+       && [ ! -x /usr/libexec/platform-python ]; then
+      dnf install -y python3 2>/dev/null \
+        || yum install -y python3 2>/dev/null \
+        || true
+    fi
+    # Garantir python3-dnf para módulos que dependem dele (não obrigatório aqui,
+    # mas custa nada e ajuda em playbooks futuros).
+    if command -v python3 >/dev/null 2>&1 \
+       && ! python3 -c 'import dnf' >/dev/null 2>&1; then
+      dnf install -y python3-dnf 2>/dev/null \
+        || yum install -y python3-dnf 2>/dev/null \
+        || true
     fi
   changed_when: false
   failed_when: false
@@ -27,7 +39,7 @@
 
 # ============================ SATELLITE / RHSM ==============================
 - name: "[RHEL8+] Limpar registro anterior (best-effort)"
-  ansible.builtin.shell: |
+  ansible.builtin.raw: |
     subscription-manager clean 2>/dev/null || true
     subscription-manager unregister 2>/dev/null || true
     subscription-manager remove --all 2>/dev/null || true
@@ -51,8 +63,8 @@
   when: katello_pkg.stat.exists
   no_log: true
 
-- name: "[RHEL8+] Reconstruir katello-ca-consumer no host via base64 (sem módulo copy)"
-  ansible.builtin.shell: |
+- name: "[RHEL8+] Reconstruir katello-ca-consumer no host via base64 (sem módulo copy/python)"
+  ansible.builtin.raw: |
     echo '{{ katello_b64 }}' | base64 -d > /tmp/katello-ca-consumer-latest.noarch.rpm
   when: katello_pkg.stat.exists
   changed_when: true
@@ -146,12 +158,11 @@
   when: ad_domain not in (realm_current.stdout | default(''))
 
 - name: "[RHEL8+] Join no domínio (idempotente)"
-  ansible.builtin.shell:
-    cmd: >
-      echo {{ cyberark_creds.Content | quote }} |
-      /usr/sbin/adcli join --domain={{ ad_domain }}
-      --domain-controller={{ ad_dc }}
-      --login-user={{ cyberark_creds.UserName | quote }}
+  ansible.builtin.raw: |
+    echo {{ cyberark_creds.Content | quote }} | /usr/sbin/adcli join \
+      --domain={{ ad_domain }} \
+      --domain-controller={{ ad_dc }} \
+      --login-user={{ cyberark_creds.UserName | quote }} \
       --stdin-password
   register: join_result
   retries: 3
@@ -231,7 +242,7 @@
 
 # ===================== AUTHSELECT + LIMPEZA SSSD + SERVIÇOS =================
 - name: "[RHEL8+] Parar sssd e limpar cache (evita 'could not initialize backend')"
-  ansible.builtin.shell: |
+  ansible.builtin.raw: |
     systemctl stop sssd 2>/dev/null || true
     rm -rf /var/lib/sss/db/* 2>/dev/null || true
     rm -rf /var/lib/sss/mc/* 2>/dev/null || true
@@ -295,7 +306,7 @@
   changed_when: false
 
 - name: "[RHEL8+] kinit do usuário (ccache isolado)"
-  ansible.builtin.shell: |
+  ansible.builtin.raw: |
     export KRB5CCNAME=FILE:/tmp/krb5cc_ansible_$$
     kdestroy -A 2>/dev/null || true
     echo {{ test_password | quote }} | kinit {{ test_user }}@{{ ad_domain | upper }}
