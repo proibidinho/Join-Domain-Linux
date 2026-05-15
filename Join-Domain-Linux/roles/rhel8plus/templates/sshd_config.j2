@@ -1,7 +1,9 @@
 # Drop-in corporativo - /etc/ssh/sshd_config.d/aap.conf
-# Gerado por Ansible (role rhel8plus). Validado por: sshd -t -f
-# Contém SOMENTE as diretivas necessárias para AD. O sshd_config principal
-# não é tocado (exceto para garantir o Include de sshd_config.d/).
+# Gerado por Ansible (role rhel8plus / ol8plus). Validado por: sshd -t -f
+#
+# Este arquivo contém SOMENTE as diretivas mínimas necessárias para
+# autenticação via AD. O /etc/ssh/sshd_config principal NÃO é tocado
+# (exceto para garantir o Include de sshd_config.d/).
 PermitRootLogin yes
 PasswordAuthentication yes
 ChallengeResponseAuthentication no
@@ -9,4 +11,7 @@ GSSAPIAuthentication yes
 GSSAPICleanupCredentials no
 UsePAM yes
 PrintMotd no
-AllowGroups {{ sshd_allowgroups }}
+
+# AllowGroups: descomente quando o time de Linux definir os grupos finais.
+# A variável 'sshd_allowgroups' está em roles/<role>/defaults/main.yml.
+# AllowGroups {{ sshd_allowgroups }}

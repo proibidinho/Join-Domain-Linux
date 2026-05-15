@@ -1,0 +1,5 @@
+# Drop-in corporativo - /etc/sudoers.d/aap
+# Gerado por Ansible (role rhel8plus). Validado por: visudo -c -f
+# Contém SOMENTE o necessário para a operação corporativa.
+Defaults!ALL    !visiblepw, always_set_home, match_group_by_gid, always_query_group_plugin
+svc_aap         ALL=(ALL)   NOPASSWD: ALL

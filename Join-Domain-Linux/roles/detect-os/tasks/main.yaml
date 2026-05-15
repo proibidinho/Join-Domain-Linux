@@ -3,37 +3,37 @@
 #  Detecta o SO sem depender de Python no host alvo.
 #  - Usa `raw` para ler /etc/os-release
 #  - set_fact e group_by rodam no controller (não exigem Python no alvo)
+#  Suporte atual: RHEL 8/9 e Oracle Linux 8/9. Demais SOs caem em "unsupported".
 # ============================================================================
 
-- name: Ler /etc/os-release via raw (sem Python no alvo)
+- name: "[detect-os] Ler /etc/os-release via raw (sem Python no alvo)"
   ansible.builtin.raw: cat /etc/os-release
   register: os_release_raw
   changed_when: false
 
-
-- name: Extrair ID e VERSION_ID do os-release
-  set_fact:
+- name: "[detect-os] Extrair ID e VERSION_ID do os-release"
+  ansible.builtin.set_fact:
     os_id: >-
       {{
-        (os_release_raw.stdout | regex_findall('(?m)^ID="?([^"\n]+)"?') | first | default('unknown')) | lower
+        (os_release_raw.stdout | regex_findall('(?m)^ID="?([^"\n]+)"?')
+         | first | default('unknown')) | lower
       }}
     os_major: >-
       {{
-        (os_release_raw.stdout | regex_findall('(?m)^VERSION_ID="?([0-9]+)') | first | default('0'))
+        (os_release_raw.stdout | regex_findall('(?m)^VERSION_ID="?([0-9]+)')
+         | first | default('0'))
       }}
 
-- name: Mostrar SO detectado
+- name: "[detect-os] Mostrar SO detectado"
   ansible.builtin.debug:
-    msg: "Host {{ inventory_hostname }} -> ID={{ os_id }} VERSION_MAJOR={{ os_major }}"
+    msg: "{{ inventory_hostname }} -> ID={{ os_id }} VERSION_MAJOR={{ os_major }}"
 
-- name: Agrupar host por família/versão
+- name: "[detect-os] Agrupar host por família/versão"
   ansible.builtin.group_by:
     key: >-
       linux_{{
-        'rhel7' if (os_id == 'rhel' and os_major == '7')
-        else 'ol7'      if (os_id in ['ol','oracle','oraclelinux'] and os_major == '7')
-        else 'rhel8plus' if (os_id == 'rhel' and (os_major | int) >= 8)
-        else 'ol8plus'   if (os_id in ['ol','oracle','oraclelinux'] and (os_major | int) >= 8)
+        'rhel8plus' if (os_id == 'rhel' and (os_major | int) >= 8)
+        else 'ol8plus' if (os_id in ['ol','oracle','oraclelinux'] and (os_major | int) >= 8)
         else 'unsupported'
       }}
   changed_when: false

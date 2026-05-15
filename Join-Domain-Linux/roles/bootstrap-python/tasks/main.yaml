@@ -1,0 +1,55 @@
+---
+# ============================================================================
+#  ROLE: bootstrap-python
+#  Garante que algum Python 3 esteja instalado no host alvo. Ordem de preferência:
+#    1) Python 3.9   (pacote python39 / python3.9)
+#    2) Python 3.8   (pacote python38 / python3.8)
+#    3) python3 genérico (qualquer versão suportada pelo SO)
+#  Tudo via `raw` porque até este ponto NÃO temos garantia de Python no alvo
+#  (servidores RHEL/OL 8/9 minimal podem vir sem python3 instalado).
+#
+#  Falha de forma clara se nenhuma das tentativas funcionar.
+# ============================================================================
+
+- name: "[Bootstrap] Garantir Python 3 instalado (3.9 -> 3.8 -> python3)"
+  ansible.builtin.raw: |
+    set -u
+    # Se já existir algum interpretador, não faz nada
+    for p in /usr/libexec/platform-python /usr/bin/python3.9 \
+             /usr/bin/python3.8 /usr/bin/python3; do
+      if [ -x "$p" ]; then
+        echo "OK_EXISTING $p"
+        exit 0
+      fi
+    done
+    # Tenta instalar na ordem de preferência
+    for pkg in python39 python3.9 python38 python3.8 python3; do
+      if dnf install -y "$pkg" >/dev/null 2>&1 \
+         || yum install -y "$pkg" >/dev/null 2>&1; then
+        echo "OK_INSTALLED $pkg"
+        exit 0
+      fi
+    done
+    echo "ERRO: nao foi possivel instalar nenhuma versao de Python 3" >&2
+    exit 1
+  register: py_bootstrap
+  changed_when: "'OK_INSTALLED' in (py_bootstrap.stdout | default(''))"
+  failed_when: py_bootstrap.rc != 0
+
+- name: "[Bootstrap] Resultado da instalação do Python"
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} -> {{ py_bootstrap.stdout | trim }}"
+
+# python3-dnf é necessário se algum módulo nativo (ex. ansible.builtin.dnf)
+# for usado depois. Não usamos ele neste projeto (usamos `command: dnf …`),
+# mas instalar é barato e protege playbooks futuros.
+- name: "[Bootstrap] Garantir python3-dnf (best-effort)"
+  ansible.builtin.raw: |
+    if command -v python3 >/dev/null 2>&1 \
+       && ! python3 -c 'import dnf' >/dev/null 2>&1; then
+      dnf install -y python3-dnf 2>/dev/null \
+        || yum install -y python3-dnf 2>/dev/null \
+        || true
+    fi
+  changed_when: false
+  failed_when: false

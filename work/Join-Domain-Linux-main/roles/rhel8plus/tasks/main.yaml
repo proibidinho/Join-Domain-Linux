@@ -1,21 +1,32 @@
 ---
 # ============================================================================
 #  ROLE: rhel8plus  (RHEL 8/9 - SOMENTE Red Hat)
-#
-#  Pré-requisitos (cuidados pelo playbook antes deste role rodar):
-#    - Role `bootstrap-python` já garantiu Python 3 no host (pre_task)
-#    - Host já está no grupo linux_rhel8plus (role `detect-os`)
-#
-#  O que este role faz, em ordem:
-#    1) Coleta facts mínimos
-#    2) Registra o host no Satellite (RHEL 8 ou 9, conforme a versão)
-#    3) Desabilita SELinux e firewalld
-#    4) Instala pacotes do AD (realmd, sssd, adcli, etc) via `dnf` CLI
-#    5) Busca credenciais no CyberArk e faz o `adcli join`
-#    6) Renderiza /etc/krb5.conf, /etc/sssd/sssd.conf, drop-ins de sshd e sudoers
-#    7) authselect + limpeza de cache do SSSD + restart sequencial dos serviços
-#    8) Valida: realm list, getent, id, kinit
+#  - Registro no Satellite com tratativas para certificado e Python
+#  - Usa `command: dnf install` em vez do módulo dnf (não exige python3-dnf)
+#  - Bootstrap automático de python3-dnf via raw, caso outros módulos precisem
+#  - Validações: sshd -t/-T, visudo -c, authselect, realm/kinit/getent/id
 # ============================================================================
+
+# -------- Bootstrap (sem exigir python no alvo) ----------
+- name: "[RHEL8+] Bootstrap Python 3 + python3-dnf via raw (compat máxima)"
+  ansible.builtin.raw: |
+    # Tenta múltiplos interpretadores. Em RHEL 8 minimal pode faltar python3.
+    if ! command -v python3 >/dev/null 2>&1 \
+       && [ ! -x /usr/libexec/platform-python ]; then
+      dnf install -y python3 2>/dev/null \
+        || yum install -y python3 2>/dev/null \
+        || true
+    fi
+    # Garantir python3-dnf para módulos que dependem dele (não obrigatório aqui,
+    # mas custa nada e ajuda em playbooks futuros).
+    if command -v python3 >/dev/null 2>&1 \
+       && ! python3 -c 'import dnf' >/dev/null 2>&1; then
+      dnf install -y python3-dnf 2>/dev/null \
+        || yum install -y python3-dnf 2>/dev/null \
+        || true
+    fi
+  changed_when: false
+  failed_when: false
 
 - name: "[RHEL8+] Coletar facts mínimos"
   ansible.builtin.setup:
@@ -23,11 +34,12 @@
       - '!all'
       - '!min'
       - distribution
+      #- hostname
       - date_time
 
 # ============================ SATELLITE / RHSM ==============================
 - name: "[RHEL8+] Limpar registro anterior (best-effort)"
-  ansible.builtin.shell: |
+  ansible.builtin.raw: |
     subscription-manager clean 2>/dev/null || true
     subscription-manager unregister 2>/dev/null || true
     subscription-manager remove --all 2>/dev/null || true
@@ -51,12 +63,11 @@
   when: katello_pkg.stat.exists
   no_log: true
 
-- name: "[RHEL8+] Reconstruir katello-ca-consumer no host via base64"
-  ansible.builtin.shell: |
+- name: "[RHEL8+] Reconstruir katello-ca-consumer no host via base64 (sem módulo copy/python)"
+  ansible.builtin.raw: |
     echo '{{ katello_b64 }}' | base64 -d > /tmp/katello-ca-consumer-latest.noarch.rpm
-  args:
-    creates: /tmp/katello-ca-consumer-latest.noarch.rpm
   when: katello_pkg.stat.exists
+  changed_when: true
   no_log: true
 
 - name: "[RHEL8+] Instalar katello-ca-consumer (ignora cert/assinatura)"
@@ -67,7 +78,7 @@
   when: katello_pkg.stat.exists
 
 - name: "[RHEL8+] Registrar no Satellite (RHEL 8)"
-  ansible.builtin.command: >-
+  ansible.builtin.command: >
     subscription-manager register
     --org={{ rhsm_org }}
     --activationkey={{ rhsm_activation_key_rhel8 }}
@@ -80,7 +91,7 @@
   when: ansible_distribution_major_version == "8"
 
 - name: "[RHEL8+] Registrar no Satellite (RHEL 9)"
-  ansible.builtin.command: >-
+  ansible.builtin.command: >
     subscription-manager register
     --org={{ rhsm_org }}
     --activationkey={{ rhsm_activation_key_rhel9 }}
@@ -113,9 +124,9 @@
     enabled: false
   failed_when: false
 
-# =========================== PACOTES AD (via dnf CLI) =======================
+# =========================== PACOTES AD (via command, sem python3-dnf) ======
 - name: "[RHEL8+] Instalar pacotes AD via dnf CLI (resiliente)"
-  ansible.builtin.command: >-
+  ansible.builtin.command: >
     dnf install -y --setopt=tsflags=nodocs --skip-broken
     realmd sssd sssd-tools oddjob oddjob-mkhomedir adcli
     samba-common samba-common-tools krb5-workstation authselect
@@ -147,7 +158,7 @@
   when: ad_domain not in (realm_current.stdout | default(''))
 
 - name: "[RHEL8+] Join no domínio (idempotente)"
-  ansible.builtin.shell: |
+  ansible.builtin.raw: |
     echo {{ cyberark_creds.Content | quote }} | /usr/sbin/adcli join \
       --domain={{ ad_domain }} \
       --domain-controller={{ ad_dc }} \
@@ -188,17 +199,18 @@
     group: root
     mode: '0600'
     backup: true
+  notify: Restart sssd
 
-# ============================ SSHD ==========================================
-- name: "[RHEL8+] Criar diretório /etc/ssh/sshd_config.d"
-  ansible.builtin.file:
+# ============================ SSHD (com sshd -t) ============================
+- name: Criando o sshd_config.d
+  file:
     path: /etc/ssh/sshd_config.d
     state: directory
     owner: root
     group: root
-    mode: '0755'
-
-- name: "[RHEL8+] Backup do sshd_config atual"
+    mode: '0600'
+    
+- name: "[RHEL8+] Backup sshd_config atual"
   ansible.builtin.copy:
     src: /etc/ssh/sshd_config
     dest: "/etc/ssh/sshd_config.bkp.{{ ansible_date_time.epoch }}"
@@ -213,6 +225,7 @@
     group: root
     mode: '0600'
     validate: '/usr/sbin/sshd -t -f %s'
+  notify: Reload sshd
 
 - name: "[RHEL8+] Garantir Include /etc/ssh/sshd_config.d/*.conf"
   ansible.builtin.lineinfile:
@@ -236,14 +249,9 @@
     validate: 'visudo -c -f %s'
 
 # ===================== AUTHSELECT + LIMPEZA SSSD + SERVIÇOS =================
-- name: "[RHEL8+] Parar sssd (antes da limpeza de cache)"
-  ansible.builtin.service:
-    name: sssd
-    state: stopped
-  failed_when: false
-
-- name: "[RHEL8+] Limpar cache SSSD (evita 'could not initialize backend')"
-  ansible.builtin.shell: |
+- name: "[RHEL8+] Parar sssd e limpar cache (evita 'could not initialize backend')"
+  ansible.builtin.raw: |
+    systemctl stop sssd 2>/dev/null || true
     rm -rf /var/lib/sss/db/* 2>/dev/null || true
     rm -rf /var/lib/sss/mc/* 2>/dev/null || true
   changed_when: false
@@ -276,11 +284,10 @@
     - sshd
     - realmd
 
-# Restart sequencial - na ordem realmd -> oddjobd -> sshd -> sssd
-# Esta ordem ajuda o `realm list` a popular corretamente em alguns hosts.
-- name: "[RHEL8+] Restart sequencial dos serviços"
+- name: "[RHEL8+] Reiniciar serviços"
   ansible.builtin.service:
     name: "{{ item }}"
+    enabled: true
     state: restarted
   loop:
     - realmd
@@ -314,7 +321,7 @@
   changed_when: false
 
 - name: "[RHEL8+] kinit do usuário (ccache isolado)"
-  ansible.builtin.shell: |
+  ansible.builtin.raw: |
     export KRB5CCNAME=FILE:/tmp/krb5cc_ansible_$$
     kdestroy -A 2>/dev/null || true
     echo {{ test_password | quote }} | kinit {{ test_user }}@{{ ad_domain | upper }}

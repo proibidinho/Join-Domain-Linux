@@ -1,0 +1,10 @@
+---
+ad_domain: corp.clarobr
+ad_dc: caadscp05.corp.clarobr
+
+# Usuário de teste pós-join
+test_user: z601427
+test_password: "Dev!lmc12"
+
+# Grupos permitidos no AllowGroups do sshd (adicione seu grupo de teste aqui)
+sshd_allowgroups: "wheel root PS_crk_aap_admin PScrkaapadmin"

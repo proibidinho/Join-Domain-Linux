@@ -1,11 +1,17 @@
 ---
 # ============================================================================
-#  Projeto: Inserir Unix no domínio AD corp.clarobr
+#  Projeto: Inserir Linux no domínio AD corp.clarobr
+#
 #  Fluxo:
 #    1) Adiciona a VM ao inventory dinâmico (role: inventory)
 #    2) Detecta o SO em cada host via `raw` (sem exigir Python no alvo)
-#    3) Agrupa hosts em linux_rhel7 / linux_ol7 / linux_rhel8plus / linux_ol8plus / linux_unsupported
+#       e agrupa em linux_rhel8plus / linux_ol8plus / linux_unsupported
+#    3) PRE-TASK: garante Python 3 instalado em todo host suportado
+#       (role: bootstrap-python)
 #    4) Executa o role apropriado para cada grupo
+#
+#  Suporta: RHEL 8/9 e Oracle Linux 8/9
+#  NÃO suporta mais: RHEL 7 / Oracle Linux 7 (decisão do time)
 # ============================================================================
 
 - name: "Etapa 1 - Adicionar VMs ao inventory"
@@ -25,55 +31,25 @@
       ansible.builtin.import_role:
         name: detect-os
 
-- name: "Etapa 3a - Configurar e join AD em RHEL 7 (legado, somente raw)"
-  hosts: linux_rhel7
-  gather_facts: false
-
-  pre_tasks:
-    - name: Corrigir locale
-      raw: |
-        echo 'LANG=en_US.UTF-8' > /etc/locale.conf
-        sed -i 's/C.UTF-8/en_US.UTF-8/g' /etc/profile.d/lang.sh || true
-
-  environment:
-    LANG: en_US.UTF-8
-    LC_ALL: en_US.UTF-8
-
-  tasks:
-    - name: Executar role rhel7
-      ansible.builtin.include_role:
-        name: rhel7
-
-- name: "Etapa 3b - Configurar e join AD em Oracle Linux 7 (legado, somente raw)"
-  hosts: linux_ol7
-  gather_facts: false
-
-  pre_tasks:
-    - name: Corrigir locale
-      raw: |
-        echo 'LANG=en_US.UTF-8' > /etc/locale.conf
-        sed -i 's/C.UTF-8/en_US.UTF-8/g' /etc/profile.d/lang.sh || true
-
-  environment:
-    LANG: en_US.UTF-8
-    LC_ALL: en_US.UTF-8
-
-  tasks:
-    - name: Executar role ol7
-      ansible.builtin.include_role:
-        name: ol7
-
-- name: "Etapa 3c - Configurar e join AD em RHEL 8/9 (com Satellite)"
+- name: "Etapa 3a - Configurar e join AD em RHEL 8/9 (com Satellite)"
   hosts: linux_rhel8plus
   gather_facts: false
+  pre_tasks:
+    - name: Garantir Python 3 instalado (pre-task)
+      ansible.builtin.import_role:
+        name: bootstrap-python
   tasks:
     - name: Executar role rhel8plus
       ansible.builtin.include_role:
         name: rhel8plus
 
-- name: "Etapa 3d - Configurar e join AD em Oracle Linux 8/9 (sem Satellite)"
+- name: "Etapa 3b - Configurar e join AD em Oracle Linux 8/9 (sem Satellite)"
   hosts: linux_ol8plus
   gather_facts: false
+  pre_tasks:
+    - name: Garantir Python 3 instalado (pre-task)
+      ansible.builtin.import_role:
+        name: bootstrap-python
   tasks:
     - name: Executar role ol8plus
       ansible.builtin.include_role:
@@ -87,5 +63,6 @@
       ansible.builtin.fail:
         msg: >-
           SO não suportado por este playbook em {{ inventory_hostname }}
-          (esperado RHEL/OracleLinux 7 ou 8+). os_id={{ os_id | default('?') }}
+          (esperado RHEL 8/9 ou Oracle Linux 8/9).
+          os_id={{ os_id | default('?') }}
           os_major={{ os_major | default('?') }}

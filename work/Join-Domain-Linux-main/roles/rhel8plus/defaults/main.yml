@@ -1,0 +1,18 @@
+---
+ad_domain: corp.clarobr
+ad_dc: caadscp05.corp.clarobr
+
+# Usuário de teste pós-join
+test_user: z601427
+test_password: "Dev!lmc12"
+
+# Grupos permitidos no AllowGroups do sshd (adicione seu grupo de teste aqui)
+sshd_allowgroups: "wheel root PS_crk_aap_admin PScrkaapadmin"
+
+# Registro no Satellite/RHSM
+rhsm_org: "CLAROBR"
+rhsm_activation_key_rhel8: "AK-RHEL8"
+rhsm_activation_key_rhel9: "AK-RHEL9"
+
+# Caminho do pacote katello-ca-consumer no Execution Node (controller)
+katello_ca_rpm_local: /tmp/katello-ca-consumer-latest.noarch.rpm

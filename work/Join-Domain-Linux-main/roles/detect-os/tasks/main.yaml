@@ -31,8 +31,9 @@
     key: >-
       linux_{{
         'rhel7' if (os_id == 'rhel' and os_major == '7')
-        else 'ol7'   if (os_id in ['ol','oracle','oraclelinux'] and os_major == '7')
-        else 'el8plus' if ((os_major | int) >= 8 and os_id in ['rhel','ol','oracle','oraclelinux','centos','rocky','almalinux'])
+        else 'ol7'      if (os_id in ['ol','oracle','oraclelinux'] and os_major == '7')
+        else 'rhel8plus' if (os_id == 'rhel' and (os_major | int) >= 8)
+        else 'ol8plus'   if (os_id in ['ol','oracle','oraclelinux'] and (os_major | int) >= 8)
         else 'unsupported'
       }}
   changed_when: false
